@@ -36,7 +36,7 @@ type FileEntry struct {
 	Data      []byte
 }
 
-// ReadCR1 r에서 CR1 포맷을 읽어들임. order는 binary.LittleEndian 또는 BigEndian.
+// ReadCR1 r에서 CR1 포맷을 읽어들임
 func ReadCR1(br io.Reader, order binary.ByteOrder) (*CR1Header, error) {
 
 	// 1) 매직 3바이트 확인
@@ -164,17 +164,17 @@ func safeJoin(baseDir, relPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("rel: %w", err)
 	}
-	// ".."로 시작하면 baseDir을 벗어남
+	// ".."로 시작하면 baseDir 벗어남
 	if strings.HasPrefix(rel, "..") || rel == "." && clean == "." {
 		return "", fmt.Errorf("path escapes baseDir: %q", relPath)
 	}
 	return full, nil
 }
 
-// WriteFileEntry baseDir 아래에 e.FileName을 안전하게 저장.
+// WriteFileEntry baseDir 아래에 e.FileName 안전하게 저장.
 // - 경로 정화(safeJoin)로 경로 이탈 방지
 // - 부모 디렉터리 자동 생성
-// - 임시 파일에 쓰고 rename으로 원자적 교체
+// - 임시 파일에 쓰고 rename 원자적 교체
 func WriteFileEntry(baseDir string, e FileEntry) (string, error) {
 	if e.FileName == "" {
 		return "", fmt.Errorf("empty filename")
@@ -207,7 +207,7 @@ func WriteFileEntry(baseDir string, e FileEntry) (string, error) {
 		return "", fmt.Errorf("close: %w", err)
 	}
 
-	// Windows에서 대상이 존재하면 Rename 실패할 수 있으므로 한 번 지우기 시도
+	// Windows 대상이 존재하면 Rename 실패할 수 있으므로 한 번 지우기 시도
 	_ = os.Remove(dst)
 	if err := os.Rename(tmp.Name(), dst); err != nil {
 		return "", fmt.Errorf("rename: %w", err)
@@ -300,23 +300,42 @@ func main() {
 		baseDir := "Crashes/" + h.DirectoryName
 		err = os.MkdirAll(baseDir, 0o755)
 		if err != nil {
+			fmt.Printf("MkdirAll failed:" + err.Error())
 			c.Status(http.StatusInternalServerError)
 			return
 		}
 		for i := 0; i < int(h.FileCount); i++ {
 			entry, err := ReadFileEntry(br, binary.LittleEndian)
 			if err != nil {
+				fmt.Printf("ReadFileEntry failed:" + err.Error())
 				c.Status(http.StatusBadRequest)
 				return
 			}
 
 			fileEntryPath, err := WriteFileEntry(baseDir, *entry)
 			if err != nil {
+				fmt.Printf("WriteFileEntry failed:" + err.Error())
 				c.Status(http.StatusInternalServerError)
 				return
 			}
 
 			fmt.Printf(" - %q written.\n", fileEntryPath)
+
+			if entry.FileName == "CrashContext.runtime-xml" {
+				crashXml, err := ReadCrashXML(fileEntryPath)
+				if err != nil {
+					fmt.Printf("ReadCrashXML failed:" + err.Error())
+					c.Status(http.StatusInternalServerError)
+					return
+				}
+
+				err = SendTelegramMessage(os.Getenv("UNREALCRASHRECEIVER_BOT_TOKEN"), os.Getenv("UNREALCRASHRECEIVER_CHAT_ID"), fmt.Sprintf("<b>⚠ CRASH on Windows (Build Number: %s)</b>\n%s", crashXml.GameData.RipperBuildNumber, h.DirectoryName))
+				if err != nil {
+					fmt.Printf("SendTelegramMessage failed:" + err.Error())
+					c.Status(http.StatusInternalServerError)
+					return
+				}
+			}
 		}
 
 		c.Status(http.StatusOK)
