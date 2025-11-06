@@ -3,17 +3,23 @@ package main
 import (
 	"bufio"
 	"compress/zlib"
+	"context"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 const (
@@ -335,6 +341,8 @@ func main() {
 					c.Status(http.StatusInternalServerError)
 					return
 				}
+
+				publishCrash(h.DirectoryName)
 			}
 		}
 
@@ -342,4 +350,99 @@ func main() {
 	})
 
 	_ = router.Run(os.Getenv("UNREALCRASHRECEIVER_SERVER_ADDR"))
+}
+
+func publishCrash(body string) {
+	// ---- CLI ----
+	url := flag.String("url", os.Getenv("AMQP_URL"), "AMQP URL (amqp(s)://user:pass@host:port/vhost)")
+	queue := flag.String("queue", "crash_queue", "Queue name to publish to")
+	count := flag.Int("n", 1, "Number of messages to publish")
+	declare := flag.Bool("declare", false, "Declare the queue if not existing (durable)")
+	flag.Parse()
+
+	// ---- Connect ----
+	conn, err := amqp.Dial(*url)
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	log.Printf("Connected to %s", *url)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("channel: %v", err)
+	}
+	defer ch.Close()
+
+	// 필요 시 큐 선언(운영에선 미리 준비되어 있으면 생략 가능)
+	if *declare {
+		_, err = ch.QueueDeclare(
+			*queue, // name
+			true,   // durable
+			false,  // autoDelete
+			false,  // exclusive
+			false,  // noWait
+			nil,    // args
+		)
+		if err != nil {
+			log.Fatalf("queue.declare: %v", err)
+		}
+	}
+
+	// Publisher Confirms 활성화
+	if err := ch.Confirm(false); err != nil {
+		log.Fatalf("confirm.select: %v", err)
+	}
+	confirmCh := ch.NotifyPublish(make(chan amqp.Confirmation, 100))
+
+	// mandatory 일 때 라우팅 실패(Return) 감지
+	returnCh := ch.NotifyReturn(make(chan amqp.Return, 10))
+	go func() {
+		for r := range returnCh {
+			log.Printf("[return] code=%d text=%s key=%s exchange=%s",
+				r.ReplyCode, r.ReplyText, r.RoutingKey, r.Exchange)
+		}
+	}()
+
+	log.Printf("Publishing %d message(s) to queue '%s'...", *count, *queue)
+	for i := 1; i <= *count; i++ {
+		msg := body
+		if *count > 1 {
+			msg = fmt.Sprintf("%s #%d", body, i)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := ch.PublishWithContext(
+			ctx,
+			"",     // default exchange
+			*queue, // routing key = queue name (직접 큐로)
+			true,   // mandatory: 라우팅 실패 시 Return 받기
+			false,  // immediate: RabbitMQ에선 사용 안 함
+			amqp.Publishing{
+				ContentType:  "text/plain",
+				DeliveryMode: amqp.Persistent, // 2 = persistent (큐도 durable이어야 의미 있음)
+				Body:         []byte(msg),
+				MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+				Timestamp:    time.Now(),
+				AppId:        "go-publisher",
+			},
+		)
+		cancel()
+		if err != nil {
+			log.Fatalf("publish: %v", err)
+		}
+
+		// 전송 확인(Confirm) 대기
+		select {
+		case c := <-confirmCh:
+			if !c.Ack {
+				log.Fatalf("nack received for deliveryTag=%d", c.DeliveryTag)
+			}
+			log.Printf(" [✓] published: %q", msg)
+		case <-time.After(5 * time.Second):
+			log.Fatal("confirm timeout")
+		}
+	}
+
+	log.Println("Done.")
 }

@@ -52,6 +52,10 @@ func SendTelegramMessage(token, chatID, text string) error {
 	}
 	endpoint := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", token)
 
+	if os.Getenv("UNREALCRASHRECEIVER_DEV_BUILD") == "1" {
+		text = "(Test)" + text
+	}
+
 	form := url.Values{}
 	form.Set("chat_id", chatID)
 	form.Set("text", text)         // parse_mode 사용 안 함(이스케이프 불필요)
