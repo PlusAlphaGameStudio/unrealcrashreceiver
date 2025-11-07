@@ -334,6 +334,13 @@ func (p *program) Start(_ service.Service) error {
 }
 
 func (p *program) run() {
+
+	// ---- CLI ----
+	amqpUrl = *flag.String("url", os.Getenv("AMQP_URL"), "AMQP URL (amqp(s)://user:pass@host:port/vhost)")
+	queue = *flag.String("queue", "crash_queue", "Queue name to publish to")
+	count = *flag.Int("n", 1, "Number of messages to publish")
+	declare = *flag.Bool("declare", false, "Declare the queue if not existing (durable)")
+
 	addr := flag.String("addr", os.Getenv("UNREALCRASHRECEIVER_SERVER_ADDR"), "listen address (e.g. :8080 or 127.0.0.1:8080)")
 	mode := flag.String("gin-mode", "release", "gin mode: debug|release|test")
 
@@ -510,19 +517,44 @@ var (
 	declare = false
 )
 
+var (
+	svcCmd = flag.String("service", "", "install | uninstall | start | stop | restart | status")
+)
+
+// target이 현재 작업 디렉터리에 없으면 실행파일(.exe)이 있는 디렉터리로 chdir
+func chdirToExeDirIfMissing(target string) error {
+	// 1) 현재 작업 디렉터리에 target 파일이 있으면 그대로 사용
+	if _, err := os.Stat(target); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		// 접근권한 등 다른 오류는 그대로 반환
+		return err
+	}
+
+	// 2) 없으면 실행 파일 디렉터리로 이동
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	// 심볼릭 링크/쇼트컷 해제(가능하면)
+	if real, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = real
+	}
+	return os.Chdir(filepath.Dir(exe))
+}
+
 func main() {
+	// 예: .env 파일이 현재 폴더에 없으면 exe 폴더로 이동
+	if err := chdirToExeDirIfMissing(".env"); err != nil {
+		log.Fatalf("chdir failed: %v", err)
+	}
+
 	goDotErr := godotenv.Load()
 	if goDotErr != nil {
 		panic(errors.New("error loading .env file"))
 	}
 
 	flag.Parse()
-
-	// ---- CLI ----
-	amqpUrl = *flag.String("url", os.Getenv("AMQP_URL"), "AMQP URL (amqp(s)://user:pass@host:port/vhost)")
-	queue = *flag.String("queue", "crash_queue", "Queue name to publish to")
-	count = *flag.Int("n", 1, "Number of messages to publish")
-	declare = *flag.Bool("declare", false, "Declare the queue if not existing (durable)")
 
 	cfg := &service.Config{
 		Name:        "UnrealCrashReceiver",                               // 서비스 내부 이름 (영문/고유)
@@ -546,8 +578,6 @@ func main() {
 
 	logger, _ := svc.Logger(nil)
 	prg.log = logger
-
-	svcCmd := flag.String("service", "", "install | uninstall | start | stop | restart | status")
 
 	// 서비스 관리 명령
 	if *svcCmd != "" {
