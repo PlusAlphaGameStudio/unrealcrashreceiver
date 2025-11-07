@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/kardianos/service"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -226,16 +227,139 @@ func WriteFileEntry(baseDir string, e FileEntry) (string, error) {
 	return dst, nil
 }
 
-func main() {
-	goDotErr := godotenv.Load()
-	if goDotErr != nil {
-		panic(errors.New("error loading .env file"))
+func publishCrash(body string) {
+
+	// ---- Connect ----
+	conn, err := amqp.Dial(amqpUrl)
+	if err != nil {
+		log.Fatalf("dial: %v", err)
+	}
+	defer func(conn *amqp.Connection) {
+		_ = conn.Close()
+	}(conn)
+	log.Printf("Connected to %s", amqpUrl)
+
+	ch, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("channel: %v", err)
+	}
+	defer func(ch *amqp.Channel) {
+		_ = ch.Close()
+	}(ch)
+
+	// 필요 시 큐 선언(운영에선 미리 준비되어 있으면 생략 가능)
+	if declare {
+		_, err = ch.QueueDeclare(
+			queue, // name
+			true,  // durable
+			false, // autoDelete
+			false, // exclusive
+			false, // noWait
+			nil,   // args
+		)
+		if err != nil {
+			log.Fatalf("queue.declare: %v", err)
+		}
 	}
 
-	router := gin.Default()
+	// Publisher Confirms 활성화
+	if err := ch.Confirm(false); err != nil {
+		log.Fatalf("confirm.select: %v", err)
+	}
+	confirmCh := ch.NotifyPublish(make(chan amqp.Confirmation, 100))
+
+	// mandatory 일 때 라우팅 실패(Return) 감지
+	returnCh := ch.NotifyReturn(make(chan amqp.Return, 10))
+	go func() {
+		for r := range returnCh {
+			log.Printf("[return] code=%d text=%s key=%s exchange=%s",
+				r.ReplyCode, r.ReplyText, r.RoutingKey, r.Exchange)
+		}
+	}()
+
+	log.Printf("Publishing %d message(s) to queue '%s'...", count, queue)
+	for i := 1; i <= count; i++ {
+		msg := body
+		if count > 1 {
+			msg = fmt.Sprintf("%s #%d", body, i)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := ch.PublishWithContext(
+			ctx,
+			"",    // default exchange
+			queue, // routing key = queue name (직접 큐로)
+			true,  // mandatory: 라우팅 실패 시 Return 받기
+			false, // immediate:
+			amqp.Publishing{
+				ContentType:  "text/plain",
+				DeliveryMode: amqp.Persistent,
+				Body:         []byte(msg),
+				MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
+				Timestamp:    time.Now(),
+				AppId:        "go-publisher",
+			},
+		)
+		cancel()
+		if err != nil {
+			log.Fatalf("publish: %v", err)
+		}
+
+		// 전송 확인(Confirm) 대기
+		select {
+		case c := <-confirmCh:
+			if !c.Ack {
+				log.Fatalf("nack received for deliveryTag=%d", c.DeliveryTag)
+			}
+			log.Printf(" [✓] published: %q", msg)
+		case <-time.After(5 * time.Second):
+			log.Fatal("confirm timeout")
+		}
+	}
+
+	log.Println("Done.")
+}
+
+type program struct {
+	log service.Logger
+	srv *http.Server
+}
+
+func (p *program) Start(_ service.Service) error {
+	if p.log != nil {
+		_ = p.log.Info("service starting")
+	}
+	go p.run() // 비동기로 실제 서버 시작
+	return nil
+}
+
+func (p *program) run() {
+	addr := flag.String("addr", os.Getenv("UNREALCRASHRECEIVER_SERVER_ADDR"), "listen address (e.g. :8080 or 127.0.0.1:8080)")
+	mode := flag.String("gin-mode", "release", "gin mode: debug|release|test")
+
+	// gin 설정
+	gin.SetMode(*mode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	// (선택) 콘솔 실행일 때만 gin.Logger 미들웨어 켜기
+	if _, inService := os.LookupEnv("KARDIANOS_IN_SERVICE"); !inService {
+		r.Use(gin.Logger())
+	}
+
+	// HTTP 서버
+	p.srv = &http.Server{
+		Addr:              *addr,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
 	// Set a lower memory limit for multipart forms (default is 32 MiB)
-	router.MaxMultipartMemory = maxMaxMultipartMemory
-	router.POST(os.Getenv("UNREALCRASHRECEIVER_SERVER_PATH_PREFIX"), func(c *gin.Context) {
+	r.MaxMultipartMemory = maxMaxMultipartMemory
+
+	// 라우트
+	r.GET("/health", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	r.GET("/", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"hello": "world"}) })
+	r.POST(os.Getenv("UNREALCRASHRECEIVER_SERVER_PATH_PREFIX"), func(c *gin.Context) {
 		if c.Query("AppID") != "CrashReporter" {
 			fmt.Printf("Invalid AppID\n")
 			c.Status(http.StatusBadRequest)
@@ -349,100 +473,106 @@ func main() {
 		c.Status(http.StatusOK)
 	})
 
-	_ = router.Run(os.Getenv("UNREALCRASHRECEIVER_SERVER_ADDR"))
+	// 리스닝 시작
+	if p.log != nil {
+		_ = p.log.Infof("listening on %s (gin-mode=%s)", *addr, *mode)
+	}
+	if err := p.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if p.log != nil {
+			_ = p.log.Errorf("ListenAndServe error: %v", err)
+		}
+	}
 }
 
-func publishCrash(body string) {
-	// ---- CLI ----
-	url := flag.String("url", os.Getenv("AMQP_URL"), "AMQP URL (amqp(s)://user:pass@host:port/vhost)")
-	queue := flag.String("queue", "crash_queue", "Queue name to publish to")
-	count := flag.Int("n", 1, "Number of messages to publish")
-	declare := flag.Bool("declare", false, "Declare the queue if not existing (durable)")
+func (p *program) Stop(_ service.Service) error {
+	// 서비스 Stop(또는 콘솔의 Ctrl+C) 시 그레이스풀 셧다운
+	if p.log != nil {
+		_ = p.log.Info("service stop requested")
+	}
+	if p.srv != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := p.srv.Shutdown(ctx); err != nil {
+			if p.log != nil {
+				_ = p.log.Errorf("server shutdown: %v", err)
+			}
+		} else if p.log != nil {
+			_ = p.log.Info("server shutdown complete")
+		}
+	}
+	return nil
+}
+
+var (
+	amqpUrl = ""
+	queue   = ""
+	count   = 0
+	declare = false
+)
+
+func main() {
+	goDotErr := godotenv.Load()
+	if goDotErr != nil {
+		panic(errors.New("error loading .env file"))
+	}
+
 	flag.Parse()
 
-	// ---- Connect ----
-	conn, err := amqp.Dial(*url)
+	// ---- CLI ----
+	amqpUrl = *flag.String("url", os.Getenv("AMQP_URL"), "AMQP URL (amqp(s)://user:pass@host:port/vhost)")
+	queue = *flag.String("queue", "crash_queue", "Queue name to publish to")
+	count = *flag.Int("n", 1, "Number of messages to publish")
+	declare = *flag.Bool("declare", false, "Declare the queue if not existing (durable)")
+
+	cfg := &service.Config{
+		Name:        "UnrealCrashReceiver",                               // 서비스 내부 이름 (영문/고유)
+		DisplayName: "Unreal Minidump Crash Receiver for Ripper Service", // 서비스 표시 이름
+		Description: "Always-on worker written in Go.",
+		// Windows 전용 옵션들
+		Option: map[string]interface{}{
+			"StartType":        "automatic", // 부팅 시 자동 시작
+			"DelayedAutoStart": true,        // 자동 시작 지연
+			// "UserName": "MyDomain\\MyUser", // 특정 계정으로 실행할 때
+			// "Password": "********",
+		},
+		EnvVars: map[string]string{"KARDIANOS_IN_SERVICE": "1"},
+	}
+
+	prg := &program{}
+	svc, err := service.New(prg, cfg)
 	if err != nil {
-		log.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	log.Printf("Connected to %s", *url)
-
-	ch, err := conn.Channel()
-	if err != nil {
-		log.Fatalf("channel: %v", err)
-	}
-	defer ch.Close()
-
-	// 필요 시 큐 선언(운영에선 미리 준비되어 있으면 생략 가능)
-	if *declare {
-		_, err = ch.QueueDeclare(
-			*queue, // name
-			true,   // durable
-			false,  // autoDelete
-			false,  // exclusive
-			false,  // noWait
-			nil,    // args
-		)
-		if err != nil {
-			log.Fatalf("queue.declare: %v", err)
-		}
+		panic(err)
 	}
 
-	// Publisher Confirms 활성화
-	if err := ch.Confirm(false); err != nil {
-		log.Fatalf("confirm.select: %v", err)
-	}
-	confirmCh := ch.NotifyPublish(make(chan amqp.Confirmation, 100))
+	logger, _ := svc.Logger(nil)
+	prg.log = logger
 
-	// mandatory 일 때 라우팅 실패(Return) 감지
-	returnCh := ch.NotifyReturn(make(chan amqp.Return, 10))
-	go func() {
-		for r := range returnCh {
-			log.Printf("[return] code=%d text=%s key=%s exchange=%s",
-				r.ReplyCode, r.ReplyText, r.RoutingKey, r.Exchange)
-		}
-	}()
+	svcCmd := flag.String("service", "", "install | uninstall | start | stop | restart | status")
 
-	log.Printf("Publishing %d message(s) to queue '%s'...", *count, *queue)
-	for i := 1; i <= *count; i++ {
-		msg := body
-		if *count > 1 {
-			msg = fmt.Sprintf("%s #%d", body, i)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		err := ch.PublishWithContext(
-			ctx,
-			"",     // default exchange
-			*queue, // routing key = queue name (직접 큐로)
-			true,   // mandatory: 라우팅 실패 시 Return 받기
-			false,  // immediate: RabbitMQ에선 사용 안 함
-			amqp.Publishing{
-				ContentType:  "text/plain",
-				DeliveryMode: amqp.Persistent, // 2 = persistent (큐도 durable이어야 의미 있음)
-				Body:         []byte(msg),
-				MessageId:    fmt.Sprintf("%d", time.Now().UnixNano()),
-				Timestamp:    time.Now(),
-				AppId:        "go-publisher",
-			},
-		)
-		cancel()
-		if err != nil {
-			log.Fatalf("publish: %v", err)
-		}
-
-		// 전송 확인(Confirm) 대기
-		select {
-		case c := <-confirmCh:
-			if !c.Ack {
-				log.Fatalf("nack received for deliveryTag=%d", c.DeliveryTag)
+	// 서비스 관리 명령
+	if *svcCmd != "" {
+		switch *svcCmd {
+		case "install", "uninstall", "start", "stop", "restart":
+			if err := service.Control(svc, *svcCmd); err != nil {
+				_ = logger.Errorf("service %s failed: %v", *svcCmd, err)
+			} else {
+				_ = logger.Infof("service %s ok", *svcCmd)
 			}
-			log.Printf(" [✓] published: %q", msg)
-		case <-time.After(5 * time.Second):
-			log.Fatal("confirm timeout")
+		case "status":
+			st, err := svc.Status()
+			if err != nil {
+				_ = logger.Errorf("status failed: %v", err)
+			} else {
+				fmt.Println("status:", st) // 1=stopped, 2=start pending, 4=running...
+			}
+		default:
+			_ = logger.Errorf("unknown -service command: %s", *svcCmd)
 		}
+		return
 	}
 
-	log.Println("Done.")
+	// 서비스/콘솔 모드 모두 지원
+	if err := svc.Run(); err != nil {
+		_ = logger.Error(err)
+	}
 }
