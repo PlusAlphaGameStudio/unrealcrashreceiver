@@ -472,10 +472,10 @@ func (p *program) run() {
 					c.Status(http.StatusInternalServerError)
 					return
 				}
-
-				publishCrash(h.DirectoryName)
 			}
 		}
+
+		publishCrash(h.DirectoryName)
 
 		c.Status(http.StatusOK)
 	})
